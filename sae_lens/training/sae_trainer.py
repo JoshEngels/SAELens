@@ -156,7 +156,7 @@ class SAETrainer:
         # Train loop
         while self.n_training_tokens < self.cfg.total_training_tokens:
             # Do a training step.
-            layer_acts = self.activation_store.next_batch()[:, 0, :]
+            layer_acts = self.activation_store.next_batch()[:, 0, :].to(self.cfg.device)
             self.n_training_tokens += self.cfg.train_batch_size_tokens
 
             step_output = self._train_step(sae=self.sae, sae_in=layer_acts)
@@ -270,6 +270,7 @@ class SAETrainer:
         mse_loss = output.mse_loss
         l1_loss = output.l1_loss
         ghost_grad_loss = output.ghost_grad_loss
+        auxk_loss = output.auxk_loss
         loss = output.loss.item()
 
         # metrics for currents acts
@@ -282,13 +283,12 @@ class SAETrainer:
 
         if isinstance(ghost_grad_loss, torch.Tensor):
             ghost_grad_loss = ghost_grad_loss.item()
-        return {
+        result = {
             # losses
             "losses/mse_loss": mse_loss,
-            "losses/l1_loss": l1_loss
-            / self.current_l1_coefficient,  # normalize by l1 coefficient
             "losses/ghost_grad_loss": ghost_grad_loss,
             "losses/overall_loss": loss,
+            "losses/auxk_loss": auxk_loss,
             # variance explained
             "metrics/explained_variance": explained_variance.mean().item(),
             "metrics/explained_variance_std": explained_variance.std().item(),
@@ -297,9 +297,16 @@ class SAETrainer:
             "sparsity/mean_passes_since_fired": self.n_forward_passes_since_fired.mean().item(),
             "sparsity/dead_features": self.dead_neurons.sum().item(),
             "details/current_learning_rate": current_learning_rate,
-            "details/current_l1_coefficient": self.current_l1_coefficient,
             "details/n_training_tokens": n_training_tokens,
         }
+
+        if not self.cfg.top_k:
+            result["details/current_l1_coefficient"] = self.current_l1_coefficient
+            result["losses/l1_loss"] = (
+                l1_loss / self.current_l1_coefficient,
+            )  # normalize by l1 coefficient
+
+        return result
 
     @torch.no_grad()
     def _run_and_log_evals(self):
@@ -308,14 +315,17 @@ class SAETrainer:
             self.cfg.wandb_log_frequency * self.cfg.eval_every_n_wandb_logs
         ) == 0:
             self.sae.eval()
-            eval_metrics = run_evals(
-                sae=self.sae,
-                activation_store=self.activation_store,
-                model=self.model,
-                n_eval_batches=self.cfg.n_eval_batches,
-                eval_batch_size_prompts=self.cfg.eval_batch_size_prompts,
-                model_kwargs=self.cfg.model_kwargs,
-            )
+            if self.model is not None:
+                eval_metrics = run_evals(
+                    sae=self.sae,
+                    activation_store=self.activation_store,
+                    model=self.model,
+                    n_eval_batches=self.cfg.n_eval_batches,
+                    eval_batch_size_prompts=self.cfg.eval_batch_size_prompts,
+                    model_kwargs=self.cfg.model_kwargs,
+                )
+            else:
+                eval_metrics = {}
 
             W_dec_norm_dist = self.sae.W_dec.norm(dim=1).detach().cpu().numpy()
             b_e_dist = self.sae.b_enc.detach().cpu().numpy()
@@ -375,7 +385,7 @@ class SAETrainer:
 
         if self.n_training_steps % update_interval == 0:
             pbar.set_description(
-                f"{self.n_training_steps}| MSE Loss {step_output.mse_loss:.3f} | L1 {step_output.l1_loss:.3f}"
+                f"{self.n_training_steps}| MSE Loss {step_output.mse_loss:.3f} | L1 {step_output.l1_loss:.3f} | Sim Loss {step_output.similarity_loss} | Auxk Loss {step_output.auxk_loss}"
             )
             pbar.update(update_interval * self.cfg.train_batch_size_tokens)
 

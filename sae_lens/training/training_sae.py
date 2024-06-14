@@ -4,7 +4,7 @@ https://github.com/ArthurConmy/sae/blob/main/sae/model.py
 
 import os
 from dataclasses import dataclass
-from typing import Any, Optional
+from typing import Any, Callable, Optional, Tuple
 
 import einops
 import torch
@@ -27,6 +27,8 @@ class TrainStepOutput:
     mse_loss: float
     l1_loss: float
     ghost_grad_loss: float
+    similarity_loss: float
+    auxk_loss: float
 
 
 @dataclass
@@ -35,6 +37,9 @@ class TrainingSAEConfig(SAEConfig):
     # Sparsity Loss Calculations
     l1_coefficient: float
     lp_norm: float
+    reduction_prel1_function: Optional[
+        Callable[[torch.Tensor, torch.Tensor], Tuple[torch.Tensor, torch.Tensor]]
+    ]
     use_ghost_grads: bool
     normalize_sae_decoder: bool
     noise_scale: float
@@ -43,6 +48,8 @@ class TrainingSAEConfig(SAEConfig):
     decoder_heuristic_init: bool = False
     init_encoder_as_decoder_transpose: bool = False
     scale_sparsity_penalty_by_decoder_norm: bool = False
+    top_k: Optional[int] = None
+    auxk_loss_scale: Optional[float] = None
 
     @classmethod
     def from_sae_runner_config(
@@ -78,6 +85,8 @@ class TrainingSAEConfig(SAEConfig):
             init_encoder_as_decoder_transpose=cfg.init_encoder_as_decoder_transpose,
             scale_sparsity_penalty_by_decoder_norm=cfg.scale_sparsity_penalty_by_decoder_norm,
             normalize_activations=cfg.normalize_activations,
+            top_k=cfg.top_k,
+            auxk_loss_scale=cfg.auxk_loss_scale,
         )
 
     @classmethod
@@ -185,6 +194,14 @@ class TrainingSAE(SAE):
         )
         feature_acts = self.hook_sae_acts_post(self.activation_fn(hidden_pre_noised))
 
+        if self.cfg.top_k:
+            top_k_values, top_k_indices = feature_acts.topk(
+                self.cfg.top_k, dim=-1, sorted=False
+            )
+            feature_acts = torch.zeros_like(feature_acts).scatter_(
+                dim=-1, index=top_k_indices, src=top_k_values
+            )
+
         return feature_acts, hidden_pre_noised
 
     def forward(
@@ -211,7 +228,7 @@ class TrainingSAE(SAE):
 
         # MSE LOSS
         per_item_mse_loss = self.mse_loss_fn(sae_out, sae_in)
-        mse_loss = per_item_mse_loss.sum(dim=-1).mean()
+        mse_loss = per_item_mse_loss.mean(dim=-1).mean()
 
         # GHOST GRADS
         if self.cfg.use_ghost_grads and self.training and dead_neuron_mask is not None:
@@ -228,17 +245,55 @@ class TrainingSAE(SAE):
         else:
             ghost_grad_loss = 0.0
 
+        if self.cfg.auxk_loss_scale and self.training and dead_neuron_mask is not None:
+            # Heuristic from Appendix B.1 in the paper
+            k_aux = sae_out.shape[-1] // 2
+
+            # Reduce the scale of the loss if there are a small number of dead latents
+            num_dead = int(dead_neuron_mask.sum().item())
+            scale = min(num_dead / k_aux, 1.0)
+            k_aux = min(k_aux, num_dead)
+
+            # Don't include living latents in this loss
+            auxk_latents = torch.where(dead_neuron_mask[None], feature_acts, -torch.inf)
+
+            # Top-k dead latents
+            auxk_acts, auxk_indices = auxk_latents.topk(k_aux, sorted=False)
+
+            # Encourage the top latents to predict the residual of the top k living latents
+            auxk_hiddens = torch.zeros_like(feature_acts).scatter_(
+                dim=-1, index=auxk_indices, src=auxk_acts
+            )
+            e_hat = self.decode(auxk_hiddens)
+            auxk_loss = (e_hat + sae_in - sae_out).pow(2).sum(0)
+            auxk_loss = (
+                scale * torch.mean(auxk_loss)
+            ).item() * self.cfg.auxk_loss_scale
+        else:
+            auxk_loss = 0
+
         # SPARSITY LOSS
         # either the W_dec norms are 1 and this won't do anything or they are not 1
         # and we're using their norm in the loss function.
         weighted_feature_acts = feature_acts * self.W_dec.norm(dim=1)
-        sparsity = weighted_feature_acts.norm(
-            p=self.cfg.lp_norm, dim=-1
-        )  # sum over the feature dimension
 
-        l1_loss = (current_l1_coefficient * sparsity).mean()
+        if self.cfg.reduction_prel1_function is not None:
+            weighted_feature_acts, similarity_loss = self.cfg.reduction_prel1_function(
+                weighted_feature_acts, self.W_dec
+            )
+        else:
+            similarity_loss = torch.tensor(0.0, device=self.device)
 
-        loss = mse_loss + l1_loss + ghost_grad_loss
+        if not self.cfg.top_k:
+            sparsity = weighted_feature_acts.norm(
+                p=self.cfg.lp_norm, dim=-1
+            )  # sum over the feature dimension
+
+            l1_loss = (current_l1_coefficient * sparsity).mean()
+        else:
+            l1_loss = torch.tensor(0.0, device=self.device)
+
+        loss = mse_loss + l1_loss + ghost_grad_loss + similarity_loss + auxk_loss
 
         return TrainStepOutput(
             sae_in=sae_in,
@@ -247,6 +302,8 @@ class TrainingSAE(SAE):
             loss=loss,
             mse_loss=mse_loss.item(),
             l1_loss=l1_loss.item(),
+            similarity_loss=similarity_loss.item(),
+            auxk_loss=auxk_loss,
             ghost_grad_loss=(
                 ghost_grad_loss.item()
                 if isinstance(ghost_grad_loss, torch.Tensor)

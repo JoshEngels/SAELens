@@ -38,17 +38,26 @@ class SAETrainingRunner:
     def __init__(self, cfg: LanguageModelSAERunnerConfig):
         self.cfg = cfg
 
-        self.model = load_model(
-            self.cfg.model_class_name,
-            self.cfg.model_name,
-            device=self.cfg.device,
-            model_from_pretrained_kwargs=self.cfg.model_from_pretrained_kwargs,
-        )
+        if self.cfg.synthetic_data is not None:
+            self.activations_store = self.cfg.synthetic_data
+            self.model = None
+            self.cfg.model_name = "synthetic"
+            self.cfg.model_class_name = "synthetic"
+            self.cfg.hook_name = "synthetic"
+            if "synthetic" not in self.cfg.dataset_path:
+                self.cfg.dataset_path = "synthetic"
+        else:
+            self.model = load_model(
+                self.cfg.model_class_name,
+                self.cfg.model_name,
+                device=self.cfg.device,
+                model_from_pretrained_kwargs=self.cfg.model_from_pretrained_kwargs,
+            )
 
-        self.activations_store = ActivationsStore.from_config(
-            self.model,
-            self.cfg,
-        )
+            self.activations_store = ActivationsStore.from_config(
+                self.model,
+                self.cfg,
+            )
 
         if self.cfg.from_pretrained_path is not None:
             self.sae = TrainingSAE.load_from_pretrained(

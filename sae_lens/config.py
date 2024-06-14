@@ -1,12 +1,13 @@
 import json
 import os
 from dataclasses import dataclass, field
-from typing import Any, Literal, Optional, cast
+from typing import Any, Callable, Literal, Optional, Tuple, cast
 
 import torch
 import wandb
 
 from sae_lens import __version__
+from sae_lens.synthetic_data import SyntheticActivationStore
 
 DTYPE_MAP = {
     "float32": torch.float32,
@@ -104,6 +105,14 @@ class LanguageModelSAERunnerConfig:
         model_kwargs (dict[str, Any]): Additional keyword arguments for the model.
         model_from_pretrained_kwargs (dict[str, Any]): Additional keyword arguments for the model from pretrained.
     """
+
+    synthetic_data: Optional[SyntheticActivationStore] = None
+    # Maps SAE relud output and decoder vecs to potentially grouped output (with l2) and to loss to add from this mapping (e.g. similarity loss between similar group elements).
+    reduction_prel1_function: Optional[
+        Callable[[torch.Tensor, torch.Tensor], Tuple[torch.Tensor, torch.Tensor]]
+    ] = None
+    top_k: Optional[int] = None
+    auxk_loss_scale: Optional[float] = None
 
     # Data Generating Function (Model + Training Distibuion)
     model_name: str = "gelu-2l"
@@ -378,6 +387,9 @@ class LanguageModelSAERunnerConfig:
             "decoder_heuristic_init": self.decoder_heuristic_init,
             "init_encoder_as_decoder_transpose": self.init_encoder_as_decoder_transpose,
             "normalize_activations": self.normalize_activations,
+            "reduction_prel1_function": self.reduction_prel1_function,
+            "top_k": self.top_k,
+            "auxk_loss_scale": self.auxk_loss_scale,
         }
 
     def to_dict(self) -> dict[str, Any]:
@@ -388,6 +400,9 @@ class LanguageModelSAERunnerConfig:
             "dtype": str(self.dtype),
             "device": str(self.device),
             "act_store_device": str(self.act_store_device),
+            # Don't serialize these generators/functions
+            "synthetic_data": None,
+            "reduction_prel1_function": None,
         }
 
         return cfg_dict
