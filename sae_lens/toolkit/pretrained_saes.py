@@ -10,8 +10,10 @@ from tqdm import tqdm
 from sae_lens.sae import SAE
 
 
-def load_sparsity(path: str) -> torch.Tensor:
+def load_sparsity(path: str) -> Optional[torch.Tensor]:
     sparsity_path = os.path.join(path, "sparsity.safetensors")
+    if not os.path.exists(sparsity_path):
+        return None
     with safe_open(sparsity_path, framework="pt", device="cpu") as f:  # type: ignore
         sparsity = f.get_tensor("sparsity")
     return sparsity
@@ -44,7 +46,7 @@ def download_sae_from_hf(
     return cfg_path, sae_path, sparsity_path
 
 
-def load_sae_from_local_path(path: str) -> Tuple[SAE, torch.Tensor]:
+def load_sae_from_local_path(path: str) -> Tuple[SAE, Optional[torch.Tensor]]:
     sae = SAE.load_from_pretrained(path)
     sparsity = load_sparsity(path)
     return sae, sparsity
