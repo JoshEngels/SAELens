@@ -228,7 +228,7 @@ class TrainingSAE(SAE):
 
         # MSE LOSS
         per_item_mse_loss = self.mse_loss_fn(sae_out, sae_in)
-        mse_loss = per_item_mse_loss.mean(dim=-1).mean()
+        mse_loss = per_item_mse_loss.sum(dim=-1).mean()
 
         # GHOST GRADS
         if self.cfg.use_ghost_grads and self.training and dead_neuron_mask is not None:
@@ -243,7 +243,9 @@ class TrainingSAE(SAE):
                 dead_neuron_mask=dead_neuron_mask,
             )
         else:
-            ghost_grad_loss = 0.0
+            ghost_grad_loss = torch.tensor(0, device=self.device)
+
+        total_variance = (sae_in - sae_in.mean(0)).pow(2).sum(0)
 
         if self.cfg.auxk_loss_scale and self.training and dead_neuron_mask is not None:
             # Heuristic from Appendix B.1 in the paper
@@ -267,10 +269,10 @@ class TrainingSAE(SAE):
             e_hat = self.decode(auxk_hiddens)
             auxk_loss = (e_hat + sae_in - sae_out).pow(2).sum(0)
             auxk_loss = (
-                scale * torch.mean(auxk_loss)
-            ).item() * self.cfg.auxk_loss_scale
+                scale * torch.mean(auxk_loss / total_variance)
+            ) * self.cfg.auxk_loss_scale
         else:
-            auxk_loss = 0
+            auxk_loss = torch.tensor(0, device=self.device)
 
         # SPARSITY LOSS
         # either the W_dec norms are 1 and this won't do anything or they are not 1
@@ -303,12 +305,8 @@ class TrainingSAE(SAE):
             mse_loss=mse_loss.item(),
             l1_loss=l1_loss.item(),
             similarity_loss=similarity_loss.item(),
-            auxk_loss=auxk_loss,
-            ghost_grad_loss=(
-                ghost_grad_loss.item()
-                if isinstance(ghost_grad_loss, torch.Tensor)
-                else ghost_grad_loss
-            ),
+            auxk_loss=auxk_loss.item(),
+            ghost_grad_loss=ghost_grad_loss.item(),
         )
 
     def calculate_ghost_grad_loss(
