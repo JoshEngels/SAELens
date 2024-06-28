@@ -129,6 +129,8 @@ class LanguageModelSAERunnerConfig:
     cached_activations_path: Optional[str] = (
         None  # Defaults to "activations/{dataset}/{model}/{full_hook_name}_{hook_head_index}"
     )
+    allow_auto_caching: bool = False
+    auto_caching_batches_per_file: int = 32
 
     # SAE Parameters
     d_in: int = 512

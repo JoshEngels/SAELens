@@ -79,6 +79,8 @@ class ActivationsStore:
             device=torch.device(cfg.act_store_device),
             dtype=cfg.dtype,
             cached_activations_path=cached_activations_path,
+            allow_auto_caching=cfg.allow_auto_caching if isinstance(cfg, LanguageModelSAERunnerConfig) else False,
+            auto_caching_batches_per_file=cfg.auto_caching_batches_per_file if isinstance(cfg, LanguageModelSAERunnerConfig) else None,
             model_kwargs=cfg.model_kwargs,
             autocast_lm=cfg.autocast_lm,
         )
@@ -134,6 +136,8 @@ class ActivationsStore:
         device: torch.device,
         dtype: str,
         cached_activations_path: str | None = None,
+        allow_auto_caching: bool = False,
+        auto_caching_batches_per_file: int | None = None,
         model_kwargs: dict[str, Any] | None = None,
         autocast_lm: bool = False,
     ):
@@ -164,8 +168,12 @@ class ActivationsStore:
 
         self.n_dataset_processed = 0
         self.iterable_dataset = iter(self.dataset)
+        self.num_tokens_loaded_from_disk = 0
 
         self.estimated_norm_scaling_factor = 1.0
+
+        self.allow_auto_caching = allow_auto_caching
+        self.cached_activations_batches_per_file = auto_caching_batches_per_file
 
         # Check if dataset is tokenized
         dataset_sample = next(self.iterable_dataset)
@@ -186,7 +194,15 @@ class ActivationsStore:
             )
         self.iterable_dataset = iter(self.dataset)  # Reset iterator after checking
 
-        self.check_cached_activations_against_config()
+        if self.allow_auto_caching:
+            assert self.cached_activations_path is not None, "cached_activations_path must be set if allow_auto_caching is True"
+            assert self.cached_activations_batches_per_file is not None, "cached_activations_batches_per_file must be set if allow_auto_caching is True"
+            if not os.path.exists(self.cached_activations_path):
+                os.makedirs(self.cached_activations_path)
+            self.next_cache_idx = 0  # which file to open next
+            self.next_idx_within_buffer = 0  # where to start reading from in that file
+        else:
+            self.check_cached_activations_against_config()
 
         # TODO add support for "mixed loading" (ie use cache until you run out, then switch over to streaming from HF)
 
@@ -369,6 +385,50 @@ class ActivationsStore:
 
         return stacked_activations
 
+    def get_buffer_from_model(self, n_batches_in_buffer: int) -> torch.Tensor:
+
+        context_size = self.context_size
+        batch_size = self.store_batch_size_prompts
+        d_in = self.d_in
+        total_size = batch_size * n_batches_in_buffer
+        num_layers = 1
+
+        refill_iterator = range(0, batch_size * n_batches_in_buffer, batch_size)
+        # Initialize empty tensor buffer of the maximum required size with an additional dimension for layers
+        new_buffer = torch.zeros(
+            (total_size, context_size, num_layers, d_in),
+            dtype=self.dtype,  # type: ignore
+            device=self.device,
+        )
+
+        # Skip the needed tokens if we've already loaded some from disk and haven't loaded any from the dataset yet
+        if self.n_dataset_processed == 0:
+            num_tokens_skipped = 0
+            while num_tokens_skipped < self.num_tokens_loaded_from_disk:
+                tokens = self._get_next_dataset_tokens()
+                num_tokens_skipped += tokens.shape[0]
+
+        for refill_batch_idx_start in refill_iterator:
+            # move batch toks to gpu for model
+            refill_batch_tokens = self.get_batch_tokens().to(self.model.cfg.device)
+            refill_activations = self.get_activations(refill_batch_tokens)
+            # move acts back to cpu
+            refill_activations.to(self.device)
+            new_buffer[
+                refill_batch_idx_start : refill_batch_idx_start + batch_size, ...
+            ] = refill_activations
+
+            # pbar.update(1)
+
+        new_buffer = new_buffer.reshape(-1, num_layers, d_in)
+        new_buffer = new_buffer[torch.randperm(new_buffer.shape[0])]
+
+        # every buffer should be normalized:
+        if self.normalize_activations == "expected_average_only_in":
+            new_buffer = self.apply_norm_scaling_factor(new_buffer)
+
+        return new_buffer
+
     def get_buffer(self, n_batches_in_buffer: int) -> torch.Tensor:
         context_size = self.context_size
         batch_size = self.store_batch_size_prompts
@@ -392,20 +452,12 @@ class ActivationsStore:
                 if not os.path.exists(
                     f"{self.cached_activations_path}/{self.next_cache_idx}.safetensors"
                 ):
-                    print(
-                        "\n\nWarning: Ran out of cached activation files earlier than expected."
+                    assert self.cached_activations_batches_per_file is not None, "cached_activations_batches_per_file must be set if allow_auto_caching is True"
+                    new_buffer_to_save = self.get_buffer_from_model(n_batches_in_buffer=self.cached_activations_batches_per_file)
+                    self.save_buffer(
+                        new_buffer_to_save,
+                        f"{self.cached_activations_path}/{self.next_cache_idx}.safetensors",
                     )
-                    print(
-                        f"Expected to have {buffer_size} activations, but only found {n_tokens_filled}."
-                    )
-                    if buffer_size % self.total_training_tokens != 0:
-                        print(
-                            "This might just be a rounding error — your batch_size * n_batches_in_buffer * context_size is not divisible by your total_training_tokens"
-                        )
-                    print(f"Returning a buffer of size {n_tokens_filled} instead.")
-                    print("\n\n")
-                    new_buffer = new_buffer[:n_tokens_filled, ...]
-                    return new_buffer
 
                 activations = self.load_buffer(
                     f"{self.cached_activations_path}/{self.next_cache_idx}.safetensors"
@@ -426,37 +478,12 @@ class ActivationsStore:
                     self.next_idx_within_buffer = 0
 
                 n_tokens_filled += activations.shape[0]
+                self.num_tokens_loaded_from_disk += activations.shape[0]
 
             return new_buffer
 
-        refill_iterator = range(0, batch_size * n_batches_in_buffer, batch_size)
-        # Initialize empty tensor buffer of the maximum required size with an additional dimension for layers
-        new_buffer = torch.zeros(
-            (total_size, context_size, num_layers, d_in),
-            dtype=self.dtype,  # type: ignore
-            device=self.device,
-        )
-
-        for refill_batch_idx_start in refill_iterator:
-            # move batch toks to gpu for model
-            refill_batch_tokens = self.get_batch_tokens().to(self.model.cfg.device)
-            refill_activations = self.get_activations(refill_batch_tokens)
-            # move acts back to cpu
-            refill_activations.to(self.device)
-            new_buffer[
-                refill_batch_idx_start : refill_batch_idx_start + batch_size, ...
-            ] = refill_activations
-
-            # pbar.update(1)
-
-        new_buffer = new_buffer.reshape(-1, num_layers, d_in)
-        new_buffer = new_buffer[torch.randperm(new_buffer.shape[0])]
-
-        # every buffer should be normalized:
-        if self.normalize_activations == "expected_average_only_in":
-            new_buffer = self.apply_norm_scaling_factor(new_buffer)
-
-        return new_buffer
+        return self.get_buffer_from_model(n_batches_in_buffer)
+        
 
     def save_buffer(self, buffer: torch.Tensor, path: str):
         """

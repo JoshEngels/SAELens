@@ -22,6 +22,7 @@ def run_evals(
     hook_name = sae.cfg.hook_name
     hook_head_index = sae.cfg.hook_head_index
     ### Evals
+    # Note: If activation_store is using caching this can be tokens the model has already been trained on
     eval_tokens = activation_store.get_batch_tokens(eval_batch_size_prompts)
 
     # TODO: Come up with a cleaner long term strategy here for SAEs that do reshaping.
