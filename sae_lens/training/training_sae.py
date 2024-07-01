@@ -195,12 +195,37 @@ class TrainingSAE(SAE):
         feature_acts = self.hook_sae_acts_post(self.activation_fn(hidden_pre_noised))
 
         if self.cfg.top_k:
-            top_k_values, top_k_indices = feature_acts.topk(
-                self.cfg.top_k, dim=-1, sorted=False
-            )
-            feature_acts = torch.zeros_like(feature_acts).scatter_(
-                dim=-1, index=top_k_indices, src=top_k_values
-            )
+
+            if self.cfg.reduction_prel1_function is not None:
+                weighted_feature_acts, _ = self.cfg.reduction_prel1_function(
+                    feature_acts, self.W_dec
+                )
+                scale_down_factor = (
+                    feature_acts.shape[-1] // weighted_feature_acts.shape[-1]
+                )
+                # print(feature_acts.shape, weighted_feature_acts.shape, scale_down_factor)
+                assert (
+                    scale_down_factor == 2
+                )  # For now only support uniform group sizes of 2
+                _, top_k_indices = weighted_feature_acts.topk(
+                    self.cfg.top_k, dim=-1, sorted=False
+                )
+                group_elem_1_indices = top_k_indices * scale_down_factor
+                group_elem_2_indices = top_k_indices * scale_down_factor + 1
+                group_elem_1_values = feature_acts.gather(-1, group_elem_1_indices)
+                group_elem_2_values = feature_acts.gather(-1, group_elem_2_indices)
+                feature_acts = torch.zeros_like(feature_acts).scatter_(
+                    dim=-1, index=group_elem_1_indices, src=group_elem_1_values
+                ) + torch.zeros_like(feature_acts).scatter_(
+                    dim=-1, index=group_elem_2_indices, src=group_elem_2_values
+                )
+            else:
+                top_k_values, top_k_indices = feature_acts.topk(
+                    self.cfg.top_k, dim=-1, sorted=False
+                )
+                feature_acts = torch.zeros_like(feature_acts).scatter_(
+                    dim=-1, index=top_k_indices, src=top_k_values
+                )
 
         return feature_acts, hidden_pre_noised
 
@@ -245,48 +270,48 @@ class TrainingSAE(SAE):
         else:
             ghost_grad_loss = torch.tensor(0, device=self.device)
 
-        total_variance = (sae_in - sae_in.mean(0)).pow(2).sum(0)
+        # total_variance = (sae_in - sae_in.mean(0)).pow(2).sum(0)
 
-        if self.cfg.auxk_loss_scale and self.training and dead_neuron_mask is not None:
-            # Heuristic from Appendix B.1 in the paper
-            k_aux = sae_out.shape[-1] // 2
+        # if self.cfg.auxk_loss_scale and self.training and dead_neuron_mask is not None:
+        #     # Heuristic from Appendix B.1 in the paper
+        #     k_aux = sae_out.shape[-1] // 2
 
-            # Reduce the scale of the loss if there are a small number of dead latents
-            num_dead = int(dead_neuron_mask.sum().item())
-            scale = min(num_dead / k_aux, 1.0)
-            k_aux = min(k_aux, num_dead)
+        #     # Reduce the scale of the loss if there are a small number of dead latents
+        #     num_dead = int(dead_neuron_mask.sum().item())
+        #     scale = min(num_dead / k_aux, 1.0)
+        #     k_aux = min(k_aux, num_dead)
 
-            # Don't include living latents in this loss
-            auxk_latents = torch.where(dead_neuron_mask[None], feature_acts, -torch.inf)
+        #     # Don't include living latents in this loss
+        #     auxk_latents = torch.where(dead_neuron_mask[None], feature_acts, -torch.inf)
 
-            # Top-k dead latents
-            auxk_acts, auxk_indices = auxk_latents.topk(k_aux, sorted=False)
+        #     # Top-k dead latents
+        #     auxk_acts, auxk_indices = auxk_latents.topk(k_aux, sorted=False)
 
-            # Encourage the top latents to predict the residual of the top k living latents
-            auxk_hiddens = torch.zeros_like(feature_acts).scatter_(
-                dim=-1, index=auxk_indices, src=auxk_acts
-            )
-            e_hat = self.decode(auxk_hiddens)
-            auxk_loss = (e_hat + sae_in - sae_out).pow(2).sum(0)
-            auxk_loss = (
-                scale * torch.mean(auxk_loss / total_variance)
-            ) * self.cfg.auxk_loss_scale
-        else:
-            auxk_loss = torch.tensor(0, device=self.device)
+        #     # Encourage the top latents to predict the residual of the top k living latents
+        #     auxk_hiddens = torch.zeros_like(feature_acts).scatter_(
+        #         dim=-1, index=auxk_indices, src=auxk_acts
+        #     )
+        #     e_hat = self.decode(auxk_hiddens)
+        #     auxk_loss = (e_hat + sae_in - sae_out).pow(2).sum(0)
+        #     auxk_loss = (
+        #         scale * torch.mean(auxk_loss / total_variance)
+        #     ) * self.cfg.auxk_loss_scale
+        # else:
+        auxk_loss = torch.tensor(0, device=self.device)
 
         # SPARSITY LOSS
         # either the W_dec norms are 1 and this won't do anything or they are not 1
         # and we're using their norm in the loss function.
         weighted_feature_acts = feature_acts * self.W_dec.norm(dim=1)
 
-        if self.cfg.reduction_prel1_function is not None:
-            weighted_feature_acts, similarity_loss = self.cfg.reduction_prel1_function(
-                weighted_feature_acts, self.W_dec
-            )
-        else:
-            similarity_loss = torch.tensor(0.0, device=self.device)
-
         if not self.cfg.top_k:
+            if self.cfg.reduction_prel1_function is not None:
+                weighted_feature_acts, similarity_loss = (
+                    self.cfg.reduction_prel1_function(weighted_feature_acts, self.W_dec)
+                )
+            else:
+                similarity_loss = torch.tensor(0.0, device=self.device)
+
             sparsity = weighted_feature_acts.norm(
                 p=self.cfg.lp_norm, dim=-1
             )  # sum over the feature dimension
@@ -294,6 +319,11 @@ class TrainingSAE(SAE):
             l1_loss = (current_l1_coefficient * sparsity).mean()
         else:
             l1_loss = torch.tensor(0.0, device=self.device)
+
+            if self.cfg.reduction_prel1_function is not None:
+                _, similarity_loss = self.cfg.reduction_prel1_function(feature_acts, self.W_dec)
+            else:
+                similarity_loss = torch.tensor(0.0, device=self.device)
 
         loss = mse_loss + l1_loss + ghost_grad_loss + similarity_loss + auxk_loss
 

@@ -79,8 +79,16 @@ class ActivationsStore:
             device=torch.device(cfg.act_store_device),
             dtype=cfg.dtype,
             cached_activations_path=cached_activations_path,
-            allow_auto_caching=cfg.allow_auto_caching if isinstance(cfg, LanguageModelSAERunnerConfig) else False,
-            auto_caching_batches_per_file=cfg.auto_caching_batches_per_file if isinstance(cfg, LanguageModelSAERunnerConfig) else None,
+            allow_auto_caching=(
+                cfg.allow_auto_caching
+                if isinstance(cfg, LanguageModelSAERunnerConfig)
+                else False
+            ),
+            auto_caching_batches_per_file=(
+                cfg.auto_caching_batches_per_file
+                if isinstance(cfg, LanguageModelSAERunnerConfig)
+                else None
+            ),
             model_kwargs=cfg.model_kwargs,
             autocast_lm=cfg.autocast_lm,
         )
@@ -195,8 +203,12 @@ class ActivationsStore:
         self.iterable_dataset = iter(self.dataset)  # Reset iterator after checking
 
         if self.allow_auto_caching:
-            assert self.cached_activations_path is not None, "cached_activations_path must be set if allow_auto_caching is True"
-            assert self.cached_activations_batches_per_file is not None, "cached_activations_batches_per_file must be set if allow_auto_caching is True"
+            assert (
+                self.cached_activations_path is not None
+            ), "cached_activations_path must be set if allow_auto_caching is True"
+            assert (
+                self.cached_activations_batches_per_file is not None
+            ), "cached_activations_batches_per_file must be set if allow_auto_caching is True"
             if not os.path.exists(self.cached_activations_path):
                 os.makedirs(self.cached_activations_path)
             self.next_cache_idx = 0  # which file to open next
@@ -452,8 +464,12 @@ class ActivationsStore:
                 if not os.path.exists(
                     f"{self.cached_activations_path}/{self.next_cache_idx}.safetensors"
                 ):
-                    assert self.cached_activations_batches_per_file is not None, "cached_activations_batches_per_file must be set if allow_auto_caching is True"
-                    new_buffer_to_save = self.get_buffer_from_model(n_batches_in_buffer=self.cached_activations_batches_per_file)
+                    assert (
+                        self.cached_activations_batches_per_file is not None
+                    ), "cached_activations_batches_per_file must be set if allow_auto_caching is True"
+                    new_buffer_to_save = self.get_buffer_from_model(
+                        n_batches_in_buffer=self.cached_activations_batches_per_file
+                    )
                     self.save_buffer(
                         new_buffer_to_save,
                         f"{self.cached_activations_path}/{self.next_cache_idx}.safetensors",
@@ -483,7 +499,6 @@ class ActivationsStore:
             return new_buffer
 
         return self.get_buffer_from_model(n_batches_in_buffer)
-        
 
     def save_buffer(self, buffer: torch.Tensor, path: str):
         """
