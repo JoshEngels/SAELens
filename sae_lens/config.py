@@ -6,6 +6,7 @@ from typing import Any, Literal, Optional, cast
 import torch
 import wandb
 from datasets import Dataset, DatasetDict, IterableDataset, IterableDatasetDict
+from sae_lens.synthetic_data import SyntheticActivationStore
 
 from sae_lens import __version__
 
@@ -110,9 +111,9 @@ class LanguageModelSAERunnerConfig:
     """
 
     # Data Generating Function (Model + Training Distibuion)
-    model_name: str = "gelu-2l"
-    model_class_name: str = "HookedTransformer"
-    hook_name: str = "blocks.0.hook_mlp_out"
+    model_name: str | None = "gelu-2l"
+    model_class_name: str | None = "HookedTransformer"
+    hook_name: str | None = "blocks.0.hook_mlp_out"
     hook_eval: str = "NOT_IN_USE"
     hook_layer: int = 0
     hook_head_index: Optional[int] = None
@@ -131,7 +132,7 @@ class LanguageModelSAERunnerConfig:
     d_in: int = 512
     d_sae: Optional[int] = None
     b_dec_init_method: str = "geometric_median"
-    expansion_factor: int = 4
+    expansion_factor: int = -1
     activation_fn: str = "relu"  # relu, tanh-relu, topk
     activation_fn_kwargs: dict[str, Any] = field(default_factory=dict)  # for topk
     normalize_sae_decoder: bool = True
@@ -228,6 +229,9 @@ class LanguageModelSAERunnerConfig:
     sae_lens_version: str = field(default_factory=lambda: __version__)
     sae_lens_training_version: str = field(default_factory=lambda: __version__)
 
+    # Synthetic data
+    synthetic_data: None | SyntheticActivationStore = None
+
     def __post_init__(self):
 
         if self.resume:
@@ -244,8 +248,14 @@ class LanguageModelSAERunnerConfig:
                 self.hook_head_index,
             )
 
-        if not isinstance(self.expansion_factor, list):
-            self.d_sae = self.d_in * self.expansion_factor
+        if self.d_sae is None:
+            if not isinstance(self.expansion_factor, list):
+                self.d_sae = self.d_in * self.expansion_factor
+        if self.expansion_factor == -1:
+            assert self.d_sae is not None
+            self.expansion_factor = self.d_sae // self.d_in
+
+        assert self.d_sae == self.d_in * self.expansion_factor
         self.tokens_per_buffer = (
             self.train_batch_size_tokens * self.context_size * self.n_batches_in_buffer
         )
@@ -400,6 +410,7 @@ class LanguageModelSAERunnerConfig:
             "dtype": str(self.dtype),
             "device": str(self.device),
             "act_store_device": str(self.act_store_device),
+            "synthetic_data": "SyntheticActivationStore" if self.synthetic_data else None,
         }
 
         return cfg_dict
@@ -428,7 +439,7 @@ class CacheActivationsRunnerConfig:
     # Data Generating Function (Model + Training Distibuion)
     model_name: str = "gelu-2l"
     model_class_name: str = "HookedTransformer"
-    hook_name: str = "blocks.{layer}.hook_mlp_out"
+    hook_name: str | None = "blocks.{layer}.hook_mlp_out"
     hook_layer: int = 0
     hook_head_index: Optional[int] = None
     dataset_path: str = ""

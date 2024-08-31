@@ -14,6 +14,7 @@ from sae_lens.evals import EvalConfig, run_evals
 from sae_lens.training.activations_store import ActivationsStore
 from sae_lens.training.optim import L1Scheduler, get_lr_scheduler
 from sae_lens.training.training_sae import TrainingSAE, TrainStepOutput
+from sae_lens.synthetic_data import SyntheticActivationStore
 
 # used to map between parameters which are updated during finetuning and the config str.
 FINETUNING_PARAMETERS = {
@@ -50,9 +51,9 @@ class SAETrainer:
 
     def __init__(
         self,
-        model: HookedRootModule,
+        model: HookedRootModule | None,
         sae: TrainingSAE,
-        activation_store: ActivationsStore,
+        activation_store: ActivationsStore | SyntheticActivationStore,
         save_checkpoint_fn,  # type: ignore
         cfg: LanguageModelSAERunnerConfig,
     ) -> None:
@@ -323,7 +324,7 @@ class SAETrainer:
         # record loss frequently, but not all the time.
         if (self.n_training_steps + 1) % (
             self.cfg.wandb_log_frequency * self.cfg.eval_every_n_wandb_logs
-        ) == 0:
+        ) == 0 and self.model is not None:
             self.sae.eval()
             eval_metrics = run_evals(
                 sae=self.sae,
@@ -399,7 +400,7 @@ class SAETrainer:
 
         if self.n_training_steps % update_interval == 0:
             pbar.set_description(
-                f"{self.n_training_steps}| MSE Loss {step_output.mse_loss:.3f} | L1 {step_output.l1_loss:.3f}"
+                f"{self.n_training_steps}| MSE Loss {step_output.mse_loss:.3f} | L1 {step_output.l1_loss:.3f} | L0 {step_output.feature_acts.sum(-1).mean().item():.3f}"
             )
             pbar.update(update_interval * self.cfg.train_batch_size_tokens)
 

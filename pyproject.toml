@@ -38,7 +38,8 @@ pyyaml = "^6.0.1"
 pytest-profiling = "^1.7.0"
 zstandard = "^0.22.0"
 typing-extensions = "^4.10.0"
-
+nbformat = "*"
+orjson = "3.10.1"
 
 [tool.poetry.group.dev.dependencies]
 black = "24.4.0"

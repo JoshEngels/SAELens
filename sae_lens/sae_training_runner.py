@@ -12,6 +12,7 @@ from transformer_lens.hook_points import HookedRootModule
 from sae_lens.config import HfDataset, LanguageModelSAERunnerConfig
 from sae_lens.load_model import load_model
 from sae_lens.sae import SAE_CFG_PATH, SAE_WEIGHTS_PATH, SPARSITY_PATH
+from sae_lens.synthetic_data import SyntheticActivationStore
 from sae_lens.training.activations_store import ActivationsStore
 from sae_lens.training.geometric_median import compute_geometric_median
 from sae_lens.training.sae_trainer import SAETrainer
@@ -32,9 +33,9 @@ class SAETrainingRunner:
     """
 
     cfg: LanguageModelSAERunnerConfig
-    model: HookedRootModule
+    model: HookedRootModule | None
     sae: TrainingSAE
-    activations_store: ActivationsStore
+    activations_store: ActivationsStore | SyntheticActivationStore
 
     def __init__(
         self,
@@ -53,21 +54,31 @@ class SAETrainingRunner:
 
         self.cfg = cfg
 
-        if override_model is None:
-            self.model = load_model(
-                self.cfg.model_class_name,
-                self.cfg.model_name,
-                device=self.cfg.device,
-                model_from_pretrained_kwargs=self.cfg.model_from_pretrained_kwargs,
-            )
+        if self.cfg.synthetic_data is not None:
+            self.activations_store = self.cfg.synthetic_data
+            self.model = None
+            self.cfg.model_name = None
+            self.cfg.model_class_name = None
+            self.cfg.hook_name = None
+            self.cfg.dataset_path = "synthetic_data"
         else:
-            self.model = override_model
+            assert self.cfg.model_class_name is not None
+            assert self.cfg.model_name is not None
+            if override_model is None:
+                self.model = load_model(
+                    self.cfg.model_class_name,
+                    self.cfg.model_name,
+                    device=self.cfg.device,
+                    model_from_pretrained_kwargs=self.cfg.model_from_pretrained_kwargs,
+                )
+            else:
+                self.model = override_model
 
-        self.activations_store = ActivationsStore.from_config(
-            self.model,
-            self.cfg,
-            override_dataset=override_dataset,
-        )
+            self.activations_store = ActivationsStore.from_config(
+                self.model,
+                self.cfg,
+                override_dataset=override_dataset,
+            )
 
         if self.cfg.from_pretrained_path is not None:
             self.sae = TrainingSAE.load_from_pretrained(
@@ -92,6 +103,7 @@ class SAETrainingRunner:
                 config=cast(Any, self.cfg),
                 name=self.cfg.run_name,
                 id=self.cfg.wandb_id,
+                entity=self.cfg.wandb_entity,
             )
 
         trainer = SAETrainer(
@@ -165,8 +177,13 @@ class SAETrainingRunner:
         extract all activations at a certain layer and use for sae b_dec initialization
         """
 
-        if self.cfg.b_dec_init_method == "geometric_median":
+
+        if isinstance(self.activations_store, SyntheticActivationStore):
+            layer_acts = self.activations_store.next_batch().detach()[:, 0, :]
+        else:
             layer_acts = self.activations_store.storage_buffer.detach()[:, 0, :]
+            
+        if self.cfg.b_dec_init_method == "geometric_median":
             # get geometric median of the activations if we're using those.
             median = compute_geometric_median(
                 layer_acts,
@@ -174,7 +191,6 @@ class SAETrainingRunner:
             ).median
             self.sae.initialize_b_dec_with_precalculated(median)  # type: ignore
         elif self.cfg.b_dec_init_method == "mean":
-            layer_acts = self.activations_store.storage_buffer.detach().cpu()[:, 0, :]
             self.sae.initialize_b_dec_with_mean(layer_acts)  # type: ignore
 
     def save_checkpoint(

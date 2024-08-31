@@ -46,8 +46,8 @@ class SAEConfig:
 
     # dataset it was trained on details.
     context_size: int
-    model_name: str
-    hook_name: str
+    model_name: str | None
+    hook_name: str | None
     hook_layer: int
     hook_head_index: Optional[int]
     prepend_bos: bool
@@ -169,7 +169,7 @@ class SAE(HookedRootModule):
         # the z activations for hook_z SAEs. but don't know d_head if we split up the forward pass
         # into a separate encode and decode function.
         # this will cause errors if we call decode before encode.
-        if self.cfg.hook_name.endswith("_z"):
+        if self.cfg.hook_name is not None and self.cfg.hook_name.endswith("_z"):
             self.turn_on_forward_pass_hook_z_reshaping()
         else:
             # need to default the reshape fns
@@ -708,6 +708,8 @@ class SAE(HookedRootModule):
         return cls(SAEConfig.from_dict(config_dict))
 
     def turn_on_forward_pass_hook_z_reshaping(self):
+
+        assert self.cfg.hook_name is not None, "This method should only be called for hook_z SAEs."
 
         assert self.cfg.hook_name.endswith(
             "_z"
